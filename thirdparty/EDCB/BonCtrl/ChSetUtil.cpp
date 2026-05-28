@@ -1,0 +1,280 @@
+﻿#include "stdafx.h"
+#include "ChSetUtil.h"
+#include "BonCtrlDef.h"
+#include "../Common/EpgTimerUtil.h"
+#include "../Common/PathUtil.h"
+
+//チャンネル設定ファイルを読み込む
+BOOL CChSetUtil::LoadChSet(
+	const wstring& settingPath,
+	const wstring& driverName,
+	wstring tunerName
+	)
+{
+	BOOL ret = TRUE;
+	CheckFileName(tunerName);
+	bool mightExist = false;
+	if( tunerName.empty() == false ){
+		//チューナー名付きのファイルがあれば優先する
+		fs_path chSet4FilePath = fs_path(settingPath).append(fs_path(driverName).stem().concat(L"(" + tunerName + L").ChSet4.txt").native());
+		if( UtilFileExists(chSet4FilePath, &mightExist).first || mightExist ){
+			mightExist = true;
+			if( this->chText4.ParseText(chSet4FilePath.c_str()) == false ){
+				ret = FALSE;
+			}
+		}
+	}
+	if( mightExist == false ){
+		if( this->chText4.ParseText(fs_path(settingPath).append(fs_path(driverName).stem().concat(L"().ChSet4.txt").native()).c_str()) == false ){
+			ret = FALSE;
+		}
+	}
+	if( this->chText5.ParseText(fs_path(settingPath).append(L"ChSet5.txt").c_str()) == false ){
+		ret = FALSE;
+	}
+	return ret;
+}
+
+//チャンネル設定ファイルを保存する
+BOOL CChSetUtil::SaveChSet(
+	const wstring& settingPath,
+	const wstring& driverName,
+	wstring tunerName
+	)
+{
+	CheckFileName(tunerName);
+	fs_path chSet4FilePath = fs_path(settingPath).append(fs_path(driverName).stem().concat(L"(" + tunerName + L").ChSet4.txt").native());
+	fs_path chSet5FilePath = fs_path(settingPath).append(L"ChSet5.txt");
+
+	//接続待ち
+#ifdef _WIN32
+	HANDLE waitEvent = CreateEvent(NULL, FALSE, TRUE, L"Global\\" CHSET_SAVE_EVENT_WAIT);
+	if( waitEvent == NULL ){
+		return FALSE;
+	}
+	if(WaitForSingleObject(waitEvent, 10000) == WAIT_TIMEOUT){
+		CloseHandle(waitEvent);
+		return FALSE;
+	}
+#else
+	//大域的なイベントオブジェクト相当のものは用意していないのでミューテックスを使う
+	util_unique_handle waitMutex = UtilCreateGlobalMutex(CHSET_SAVE_EVENT_WAIT);
+	for( int retry = 0; retry < 30 && !waitMutex; retry++ ){
+		SleepForMsec(100 + 10 * retry);
+		waitMutex = UtilCreateGlobalMutex(CHSET_SAVE_EVENT_WAIT);
+	}
+	if( !waitMutex ){
+		return FALSE;
+	}
+#endif
+
+	BOOL ret = TRUE;
+	this->chText4.SetFilePath(chSet4FilePath.c_str());
+	if( this->chText4.SaveText() == false ){
+		ret = FALSE;
+	}else if( tunerName.empty() == false ){
+		//チューナー名付きと無しのファイルは同時に存在すべきでない
+		DeleteFile(fs_path(settingPath).append(fs_path(driverName).stem().concat(L"().ChSet4.txt").native()).c_str());
+	}
+
+	//他で更新されてる可能性あるので再読み込み
+	CParseChText5 mergeChText5;
+	mergeChText5.ParseText(chSet5FilePath.c_str());
+	//現在保持している情報を追加
+	for( const auto& ch5 : this->chText5.GetMap() ){
+		mergeChText5.AddCh(ch5.second);
+	}
+	//保存
+	if( mergeChText5.SaveText() == false ){
+		ret = FALSE;
+	}
+	//最新版を再読み込み
+	this->chText5.ParseText(chSet5FilePath.c_str());
+
+#ifdef _WIN32
+	SetEvent(waitEvent);
+	CloseHandle(waitEvent);
+#endif
+
+	return ret;
+}
+
+//チャンネルスキャン用にクリアする
+BOOL CChSetUtil::Clear()
+{
+	this->chText4.ParseText(L"");
+	this->chText5.ParseText(L"");
+	return TRUE;
+}
+
+//チャンネル情報を追加する
+BOOL CChSetUtil::AddServiceInfo(
+	DWORD space,
+	DWORD ch,
+	const wstring& chName,
+	SERVICE_INFO* serviceInfo
+	)
+{
+	CH_DATA4 item4;
+
+	item4.space = space;
+	item4.ch = ch;
+	item4.originalNetworkID = serviceInfo->original_network_id;
+	item4.transportStreamID = serviceInfo->transport_stream_id;
+	item4.serviceID = serviceInfo->service_id;
+	item4.serviceType = 0;
+	item4.partialFlag = FALSE;
+	item4.useViewFlag = TRUE;
+	item4.remoconID = 0;
+	if( serviceInfo->extInfo != NULL ){
+		item4.serviceType = serviceInfo->extInfo->service_type;
+		item4.partialFlag = serviceInfo->extInfo->partialReceptionFlag;
+		if( IsVideoServiceType(item4.serviceType) == FALSE ){
+			item4.useViewFlag = FALSE;
+		}
+		item4.serviceName = serviceInfo->extInfo->service_name;
+		item4.chName = chName;
+		if( serviceInfo->extInfo->ts_name != NULL ){
+			item4.networkName = serviceInfo->extInfo->ts_name;
+		}else if( serviceInfo->extInfo->network_name != NULL){
+			item4.networkName = serviceInfo->extInfo->network_name;
+		}
+		item4.remoconID = serviceInfo->extInfo->remote_control_key_id;
+	}
+
+	map<DWORD, CH_DATA4>::const_iterator itr;
+	for( itr = this->chText4.GetMap().begin(); itr != this->chText4.GetMap().end(); itr++ ){
+		if( itr->second.originalNetworkID == item4.originalNetworkID &&
+		    itr->second.transportStreamID == item4.transportStreamID &&
+		    itr->second.serviceID == item4.serviceID &&
+		    itr->second.space == item4.space &&
+		    itr->second.ch == item4.ch ){
+			break;
+		}
+	}
+	if( itr == this->chText4.GetMap().end() ){
+		this->chText4.AddCh(item4);
+	}
+
+	CH_DATA5 item5;
+
+	item5.originalNetworkID = serviceInfo->original_network_id;
+	item5.transportStreamID = serviceInfo->transport_stream_id;
+	item5.serviceID = serviceInfo->service_id;
+	item5.serviceType = 0;
+	item5.partialFlag = FALSE;
+	item5.epgCapFlag = TRUE;
+	item5.searchFlag = TRUE;
+	item5.remoconID = 0;
+	if( serviceInfo->extInfo != NULL ){
+		item5.serviceType = serviceInfo->extInfo->service_type;
+		item5.partialFlag = serviceInfo->extInfo->partialReceptionFlag;
+		item5.serviceName = serviceInfo->extInfo->service_name;
+		if( serviceInfo->extInfo->ts_name != NULL ){
+			item5.networkName = serviceInfo->extInfo->ts_name;
+		}else if( serviceInfo->extInfo->network_name != NULL){
+			item5.networkName = serviceInfo->extInfo->network_name;
+		}
+		if( IsVideoServiceType(item4.serviceType) == FALSE ){
+			item5.epgCapFlag = FALSE;
+			item5.searchFlag = FALSE;
+		}
+	}
+
+	this->chText5.AddCh(item5);
+
+	return TRUE;
+}
+
+//IDから物理チャンネルを検索する
+BOOL CChSetUtil::GetCh(
+	WORD ONID,
+	WORD TSID,
+	WORD SID,
+	DWORD& space,
+	DWORD& ch
+	) const
+{
+	BOOL ret = FALSE;
+	for( const auto& ch4 : this->chText4.GetMap() ){
+		if( ch4.second.originalNetworkID == ONID && ch4.second.transportStreamID == TSID ){
+			if( ret == FALSE || ch4.second.serviceID == SID ){
+				ret = TRUE;
+				space = ch4.second.space;
+				ch = ch4.second.ch;
+				//SIDが同じものを優先する
+				if( ch4.second.serviceID == SID ){
+					break;
+				}
+			}
+		}
+	}
+	return ret;
+}
+
+vector<SET_CH_INFO> CChSetUtil::GetEpgCapService() const
+{
+	vector<SET_CH_INFO> ret;
+	for( const auto& ch4 : this->chText4.GetMap() ){
+		LONGLONG key = Create64Key(ch4.second.originalNetworkID, ch4.second.transportStreamID, ch4.second.serviceID);
+		map<LONGLONG, CH_DATA5>::const_iterator itrCh5;
+		itrCh5 = this->chText5.GetMap().find(key);
+
+		if( itrCh5 != this->chText5.GetMap().end() ){
+			if( itrCh5->second.epgCapFlag == TRUE ){
+				SET_CH_INFO item;
+				item.useBonCh = TRUE;
+				item.space = ch4.second.space;
+				item.ch = ch4.second.ch;
+				if( std::find_if(ret.begin(), ret.end(), [&](const SET_CH_INFO& a) {
+				        return a.space == item.space && a.ch == item.ch; }) == ret.end() ){
+					item.useSID = TRUE;
+					item.ONID = itrCh5->second.originalNetworkID;
+					item.TSID = itrCh5->second.transportStreamID;
+					item.SID = itrCh5->second.serviceID;
+					ret.push_back(item);
+				}
+			}
+		}
+	}
+	return ret;
+}
+
+vector<SET_CH_INFO> CChSetUtil::GetEpgCapServiceAll(
+	int ONID,
+	int TSID
+	) const
+{
+	vector<SET_CH_INFO> ret;
+	for( const auto& ch5 : this->chText5.GetMap() ){
+		if( (ONID < 0 || ch5.second.originalNetworkID == ONID) &&
+		    (TSID < 0 || ch5.second.transportStreamID == TSID) &&
+		    ch5.second.epgCapFlag == TRUE ){
+			ret.emplace_back();
+			ret.back().useSID = TRUE;
+			ret.back().ONID = ch5.second.originalNetworkID;
+			ret.back().TSID = ch5.second.transportStreamID;
+			ret.back().SID = ch5.second.serviceID;
+			ret.back().useBonCh = FALSE;
+		}
+	}
+	return ret;
+}
+
+BOOL CChSetUtil::IsPartial(
+	WORD ONID,
+	WORD TSID,
+	WORD SID
+	) const
+{
+	LONGLONG key = Create64Key(ONID, TSID, SID);
+	map<LONGLONG, CH_DATA5>::const_iterator itr;
+	itr = this->chText5.GetMap().find(key);
+	if( itr != this->chText5.GetMap().end() ){
+		if( itr->second.partialFlag == 1 ){
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+

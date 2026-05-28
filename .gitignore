@@ -1,0 +1,27 @@
+# Build output
+build/
+out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+
+# Binaries
+*.dll
+*.exe
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.obj
+*.tlog
+*.log
+
+# Local/editor files
+.vs/
+.vscode/
+*.user
+*.suo

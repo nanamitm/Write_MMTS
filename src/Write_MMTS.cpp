@@ -15,13 +15,15 @@
 
 HINSTANCE g_instance = NULL;
 
-typedef BOOL (WINAPI *StartMmtsSaveFunc)(const wchar_t*, BOOL);
-typedef void (WINAPI *StopMmtsSaveFunc)();
+typedef BOOL (WINAPI *StartMmtsRecordingFunc)(const wchar_t*, BOOL, DWORD*);
+typedef void (WINAPI *StopMmtsRecordingFunc)(DWORD);
+typedef BOOL (WINAPI *GetMmtsRecordingStatusFunc)(DWORD, DWORD*, BOOL*, BOOL*);
 
 struct DanttoMmtsApi {
     HMODULE module = NULL;
-    StartMmtsSaveFunc start = nullptr;
-    StopMmtsSaveFunc stop = nullptr;
+    StartMmtsRecordingFunc start = nullptr;
+    StopMmtsRecordingFunc stop = nullptr;
+    GetMmtsRecordingStatusFunc status = nullptr;
 };
 
 DanttoMmtsApi FindDanttoMmtsApi()
@@ -36,12 +38,14 @@ DanttoMmtsApi FindDanttoMmtsApi()
     me.dwSize = sizeof(me);
     if (Module32FirstW(hSnapshot, &me)) {
         do {
-            auto start = reinterpret_cast<StartMmtsSaveFunc>(GetProcAddress(me.hModule, "StartMmtsSave"));
-            auto stop = reinterpret_cast<StopMmtsSaveFunc>(GetProcAddress(me.hModule, "StopMmtsSave"));
-            if (start != nullptr && stop != nullptr) {
+            auto start = reinterpret_cast<StartMmtsRecordingFunc>(GetProcAddress(me.hModule, "StartMmtsRecording"));
+            auto stop = reinterpret_cast<StopMmtsRecordingFunc>(GetProcAddress(me.hModule, "StopMmtsRecording"));
+            auto status = reinterpret_cast<GetMmtsRecordingStatusFunc>(GetProcAddress(me.hModule, "GetMmtsRecordingStatus"));
+            if (start != nullptr && stop != nullptr && status != nullptr) {
                 api.module = me.hModule;
                 api.start = start;
                 api.stop = stop;
+                api.status = status;
                 break;
             }
         } while (Module32NextW(hSnapshot, &me));
@@ -68,6 +72,7 @@ std::wstring MakeMmtsPath(LPCWSTR fileName)
 struct UnifiedInstance {
     bool useMMTS = false;
     bool mmtsStarted = false;
+    DWORD mmtsSessionId = 0;
     std::wstring mmtsSavePath;
     std::shared_ptr<CWriteMain> originalInst;
     std::mutex stateMutex;
@@ -255,7 +260,7 @@ extern "C" __declspec(dllexport) BOOL WINAPI DeleteCtrl(
         if (shouldStop) {
             DanttoMmtsApi api = FindDanttoMmtsApi();
             if (api.stop != nullptr) {
-                api.stop();
+                api.stop(inst->mmtsSessionId);
             }
         }
     }
@@ -298,7 +303,8 @@ extern "C" __declspec(dllexport) BOOL WINAPI StartSave(
             }
         }
 
-        BOOL started = api.start(path.c_str(), overWriteFlag);
+        DWORD sessionId = 0;
+        BOOL started = api.start(path.c_str(), overWriteFlag, &sessionId);
         if (!started) {
             return FALSE;
         }
@@ -306,6 +312,7 @@ extern "C" __declspec(dllexport) BOOL WINAPI StartSave(
         {
             std::lock_guard<std::mutex> stateLock(inst->stateMutex);
             inst->mmtsSavePath = path;
+            inst->mmtsSessionId = sessionId;
             inst->mmtsStarted = true;
         }
         return TRUE;
@@ -343,7 +350,7 @@ extern "C" __declspec(dllexport) BOOL WINAPI StopSave(
             if (api.stop == nullptr) {
                 return FALSE;
             }
-            api.stop();
+            api.stop(inst->mmtsSessionId);
         }
         return TRUE;
     } else {
@@ -431,11 +438,27 @@ extern "C" __declspec(dllexport) BOOL WINAPI AddTSBuff(
 
     if (inst->useMMTS) {
         bool started = false;
+        DWORD sessionId = 0;
         {
             std::lock_guard<std::mutex> stateLock(inst->stateMutex);
             started = inst->mmtsStarted;
+            sessionId = inst->mmtsSessionId;
         }
         if (!started) {
+            if (writeSize != NULL) {
+                *writeSize = 0;
+            }
+            return FALSE;
+        }
+        DanttoMmtsApi api = FindDanttoMmtsApi();
+        if (api.status == nullptr) {
+            if (writeSize != NULL) {
+                *writeSize = 0;
+            }
+            return FALSE;
+        }
+        BOOL failed = FALSE;
+        if (api.status(sessionId, nullptr, &failed, nullptr) == FALSE || failed) {
             if (writeSize != NULL) {
                 *writeSize = 0;
             }

@@ -20,25 +20,30 @@ Write_MMTS/
 - dantto4k が同一プロセスにロードされ、MMTS 保存用 export が見つかる場合
   - EDCB が指定した `.ts` 保存先を `.mmts` に置き換えます。
   - TS 書き込みは行わず、dantto4k 側で MMTS を直接保存します。
+  - MMTS は受信チャンネルの stream をそのまま保存します。
 - dantto4k が未ロード、または必要な export がない場合
   - 内蔵した EDCB 標準 Write PlugIn の処理にフォールバックし、通常の `.ts` 録画を行います。
 
 出力 DLL は 2 種類です。
 
-- `Write_MMTS_OneService.dll`: `Write_OneService` 相当。指定サービスのみ保存します。
-- `Write_MMTS_Default.dll`: `Write_Default` 相当。全 TS を保存します。
+- `Write_MMTS_OneService.dll`: TS フォールバック時は `Write_OneService` 相当。MMTS 保存時はチャンネル stream を保存します。
+- `Write_MMTS_Default.dll`: TS フォールバック時は `Write_Default` 相当。MMTS 保存時はチャンネル stream を保存します。
 
 ## 必要条件
 
 本プラグインで MMTS 保存を行うには、dantto4k 側に以下の export が必要です。
 
 ```cpp
-extern "C" __declspec(dllexport) BOOL WINAPI StartMmtsSave(const wchar_t* path, BOOL overwrite);
-extern "C" __declspec(dllexport) void WINAPI StopMmtsSave();
+extern "C" __declspec(dllexport) BOOL WINAPI StartMmtsRecording(const wchar_t* path, BOOL overwrite, DWORD* sessionId);
+extern "C" __declspec(dllexport) void WINAPI StopMmtsRecording(DWORD sessionId);
+extern "C" __declspec(dllexport) BOOL WINAPI GetMmtsRecordingStatus(DWORD sessionId, DWORD* actualMode, BOOL* failed, BOOL* fallbackUsed);
 ```
 
-`StartMmtsSave()` が `FALSE` を返した場合、Write PlugIn 側の `StartSave()` も失敗扱いにします。
+`StartMmtsRecording()` が `FALSE` を返した場合、Write PlugIn 側の `StartSave()` も失敗扱いにします。
 MMTS 保存が開始できない状態で TS データだけを破棄しないためです。
+
+`GetMmtsRecordingStatus()` で失敗が通知された場合、`AddTSBuff()` も失敗扱いにします。
+dantto4k 側で復号に失敗した場合は raw fallback が使われることがあります。
 
 ## ビルド
 

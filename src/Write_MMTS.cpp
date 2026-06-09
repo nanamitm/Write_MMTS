@@ -2,6 +2,7 @@
 #include "WriteMain.h"
 #include <string>
 #include <map>
+#include <set>
 #include <mutex>
 #include <tlhelp32.h>
 
@@ -68,6 +69,32 @@ std::wstring MakeMmtsPath(LPCWSTR fileName)
     return path;
 }
 
+std::wstring MakeNumberedPath(const std::wstring& path, int number)
+{
+    if (number <= 0) {
+        return path;
+    }
+
+    size_t slashPos = path.find_last_of(L"\\/");
+    size_t dotPos = path.find_last_of(L'.');
+    std::wstring suffix = L"-(" + std::to_wstring(number) + L")";
+    if (dotPos != std::wstring::npos &&
+        (slashPos == std::wstring::npos || dotPos > slashPos)) {
+        return path.substr(0, dotPos) + suffix + path.substr(dotPos);
+    }
+    return path + suffix;
+}
+
+std::wstring MakeMmtsMapPath(const std::wstring& path)
+{
+    return path + L"map";
+}
+
+bool FileExists(const std::wstring& path)
+{
+    return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
 // Struct to hold state for either MMTS (dantto4k) or original TS (CWriteMain)
 struct UnifiedInstance {
     bool useMMTS = false;
@@ -79,8 +106,36 @@ struct UnifiedInstance {
 };
 
 static std::map<DWORD, std::shared_ptr<UnifiedInstance>> g_instances;
+static std::set<std::wstring> g_pendingMmtsPaths;
 static DWORD g_nextId = 1;
 static std::mutex g_mutex;
+
+bool EqualPathNoCase(const std::wstring& left, const std::wstring& right)
+{
+    return _wcsicmp(left.c_str(), right.c_str()) == 0;
+}
+
+bool IsActiveMmtsPath(const std::wstring& path)
+{
+    for (const std::wstring& pendingPath : g_pendingMmtsPaths) {
+        if (EqualPathNoCase(pendingPath, path)) {
+            return true;
+        }
+    }
+
+    for (const auto& item : g_instances) {
+        const std::shared_ptr<UnifiedInstance>& inst = item.second;
+        if (!inst || !inst->useMMTS) {
+            continue;
+        }
+
+        std::lock_guard<std::mutex> stateLock(inst->stateMutex);
+        if (inst->mmtsStarted && EqualPathNoCase(inst->mmtsSavePath, path)) {
+            return true;
+        }
+    }
+    return false;
+}
 
 DWORD AllocateInstanceId()
 {
@@ -296,24 +351,54 @@ extern "C" __declspec(dllexport) BOOL WINAPI StartSave(
             return FALSE;
         }
 
-        if (!overWriteFlag) {
-            DWORD attr = GetFileAttributesW(path.c_str());
-            if (attr != INVALID_FILE_ATTRIBUTES) {
-                return FALSE;
-            }
-        }
-
         DWORD sessionId = 0;
-        BOOL started = api.start(path.c_str(), overWriteFlag, &sessionId);
+        BOOL started = FALSE;
+        for (int i = 0; i < 1000; ++i) {
+            std::wstring candidate = MakeNumberedPath(path, i);
+            bool reserved = false;
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                if (!IsActiveMmtsPath(candidate)) {
+                    g_pendingMmtsPaths.insert(candidate);
+                    reserved = true;
+                }
+            }
+            if (!reserved) {
+                continue;
+            }
+            if (!overWriteFlag && (FileExists(candidate) || FileExists(MakeMmtsMapPath(candidate)))) {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_pendingMmtsPaths.erase(candidate);
+                continue;
+            }
+
+            started = api.start(candidate.c_str(), overWriteFlag, &sessionId);
+            if (started) {
+                path = candidate;
+                std::lock_guard<std::mutex> lock(g_mutex);
+                {
+                    std::lock_guard<std::mutex> stateLock(inst->stateMutex);
+                    inst->mmtsSavePath = path;
+                    inst->mmtsSessionId = sessionId;
+                    inst->mmtsStarted = true;
+                }
+                g_pendingMmtsPaths.erase(candidate);
+                break;
+            }
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                g_pendingMmtsPaths.erase(candidate);
+            }
+            if (overWriteFlag && i == 0) {
+                continue;
+            }
+            if (!overWriteFlag && (FileExists(candidate) || FileExists(MakeMmtsMapPath(candidate)))) {
+                continue;
+            }
+            break;
+        }
         if (!started) {
             return FALSE;
-        }
-
-        {
-            std::lock_guard<std::mutex> stateLock(inst->stateMutex);
-            inst->mmtsSavePath = path;
-            inst->mmtsSessionId = sessionId;
-            inst->mmtsStarted = true;
         }
         return TRUE;
     } else {

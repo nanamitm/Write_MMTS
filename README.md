@@ -115,9 +115,32 @@ cmake --build build --config Release
 
 1. 使用する DLL を EDCB の実行フォルダにコピーします。
 2. `EpgDataCap_Bon.exe` の基本設定で Write PlugIn として選択します。
-3. dantto4k 連携が有効な環境では `.mmts`、それ以外では通常の `.ts` として保存されます。
+3. MMT/TLV(4K/8K)を受信中のチャンネルでは `.mmts`、それ以外では通常の `.ts` として保存されます。
 
 オリジナルの `Write_OneService.dll` / `Write_Default.dll` を同梱する必要はありません。
+
+### 自動削除を使う場合の設定 (EpgTimerSrv)
+
+EpgTimerSrv の自動削除(`AutoDel`)は、録画ファイルを消すときに `[DEL_EXT]` に並べた拡張子へ
+差し替えたファイルも一緒に消します。既定値は `.ts.err` と `.ts.program.txt` なので、
+`.mmts` として保存した録画では以下が消えずに残ります。
+
+- `xxx.mmts.program.txt` (番組情報ファイル)
+- `xxx.mmtsmap` (MMTS の索引ファイル)
+
+`EpgTimerSrv.ini` に以下を追記すると一緒に削除されます。`Count` を書くと既定値は使われなく
+なるため、`.ts` 用の 2 つも明示的に並べる必要があります。
+
+```ini
+[DEL_EXT]
+Count=4
+0=.ts.err
+1=.ts.program.txt
+2=.mmts.program.txt
+3=.mmtsmap
+```
+
+自動削除を使っていない場合は設定不要です。
 
 ## EDCB ソースの更新
 

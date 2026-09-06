@@ -4,6 +4,7 @@
 #include <map>
 #include <set>
 #include <mutex>
+#include <vector>
 #include <tlhelp32.h>
 
 #ifndef PLUGIN_NAME
@@ -19,40 +20,89 @@ HINSTANCE g_instance = NULL;
 typedef BOOL (WINAPI *StartMmtsRecordingFunc)(const wchar_t*, BOOL, DWORD*);
 typedef void (WINAPI *StopMmtsRecordingFunc)(DWORD);
 typedef BOOL (WINAPI *GetMmtsRecordingStatusFunc)(DWORD, DWORD*, BOOL*, BOOL*);
+typedef BOOL (WINAPI *IsMmtsRecordingAvailableFunc)();
 
 struct DanttoMmtsApi {
     HMODULE module = NULL;
     StartMmtsRecordingFunc start = nullptr;
     StopMmtsRecordingFunc stop = nullptr;
     GetMmtsRecordingStatusFunc status = nullptr;
+    // MMT/TLV以外のチャンネルも扱うモジュール(BonDriver_Mirakurun等)が
+    // 「今MMT/TLVを出力しているか」を答えるためのオプションのexport。
+    // 持たないモジュール(dantto4k等のMMT/TLV専用BonDriver)ではnullptr。
+    IsMmtsRecordingAvailableFunc available = nullptr;
 };
 
-DanttoMmtsApi FindDanttoMmtsApi()
+// MMTS保存APIを揃えてエクスポートしているモジュールを全て列挙する
+std::vector<DanttoMmtsApi> EnumMmtsProviders()
 {
-    DanttoMmtsApi api;
+    std::vector<DanttoMmtsApi> providers;
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
     if (hSnapshot == INVALID_HANDLE_VALUE) {
-        return api;
+        return providers;
     }
 
     MODULEENTRY32W me;
     me.dwSize = sizeof(me);
     if (Module32FirstW(hSnapshot, &me)) {
         do {
-            auto start = reinterpret_cast<StartMmtsRecordingFunc>(GetProcAddress(me.hModule, "StartMmtsRecording"));
-            auto stop = reinterpret_cast<StopMmtsRecordingFunc>(GetProcAddress(me.hModule, "StopMmtsRecording"));
-            auto status = reinterpret_cast<GetMmtsRecordingStatusFunc>(GetProcAddress(me.hModule, "GetMmtsRecordingStatus"));
-            if (start != nullptr && stop != nullptr && status != nullptr) {
+            DanttoMmtsApi api;
+            api.start = reinterpret_cast<StartMmtsRecordingFunc>(GetProcAddress(me.hModule, "StartMmtsRecording"));
+            api.stop = reinterpret_cast<StopMmtsRecordingFunc>(GetProcAddress(me.hModule, "StopMmtsRecording"));
+            api.status = reinterpret_cast<GetMmtsRecordingStatusFunc>(GetProcAddress(me.hModule, "GetMmtsRecordingStatus"));
+            if (api.start != nullptr && api.stop != nullptr && api.status != nullptr) {
                 api.module = me.hModule;
-                api.start = start;
-                api.stop = stop;
-                api.status = status;
-                break;
+                api.available = reinterpret_cast<IsMmtsRecordingAvailableFunc>(GetProcAddress(me.hModule, "IsMmtsRecordingAvailable"));
+                providers.push_back(api);
             }
         } while (Module32NextW(hSnapshot, &me));
     }
     CloseHandle(hSnapshot);
-    return api;
+    return providers;
+}
+
+// 今まさにMMT/TLVを出力しているモジュールを1つに絞る。
+//  - IsMmtsRecordingAvailable()を持つモジュール(BonDriver_Mirakurun等、GR/BS/CSの
+//    TSチャンネルも同じDLLで扱うBonDriver)は、TRUEを返したときだけ候補にする。
+//  - 持たないモジュール(dantto4k等のMMT/TLV専用BonDriver)は入力が常にMMT/TLVなので
+//    常に候補にする(こちらは変更なしでそのまま使える)。
+// 候補がちょうど1つのときだけMMTS保存を行う。候補が0個(=通常のTSチャンネルを受信中)
+// のときはもちろん、複数見つかった場合(dantto4kがMMT変換を有効にしたままの
+// BonDriver_Mirakurunをラップしている等、どのモジュールの出力がEDCBに届いているか
+// 確定できない構成)も、TSデータを捨てずに済む.ts保存へフォールバックする。
+bool SelectMmtsProvider(DanttoMmtsApi* selected)
+{
+    std::vector<DanttoMmtsApi> providers = EnumMmtsProviders();
+
+    const DanttoMmtsApi* candidate = nullptr;
+    size_t candidateCount = 0;
+    for (const DanttoMmtsApi& api : providers) {
+        if (api.available != nullptr && api.available() == FALSE) {
+            continue;
+        }
+        candidate = &api;
+        ++candidateCount;
+    }
+
+    if (candidateCount != 1) {
+        return false;
+    }
+    if (selected != nullptr) {
+        *selected = *candidate;
+    }
+    return true;
+}
+
+// 選んだモジュールが録画中にアンロードされないよう参照を取る
+// (FreeLibrary()で返すまでこのプラグイン専用の参照カウントが1つ増える)
+HMODULE AcquireProviderModule(const DanttoMmtsApi& api)
+{
+    HMODULE ref = NULL;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                           reinterpret_cast<LPCWSTR>(api.start), &ref) == FALSE) {
+        return NULL;
+    }
+    return ref;
 }
 
 std::wstring MakeMmtsPath(LPCWSTR fileName)
@@ -96,11 +146,18 @@ bool FileExists(const std::wstring& path)
 }
 
 // Struct to hold state for either MMTS (dantto4k) or original TS (CWriteMain)
+// MMTSとTSのどちらを使うかはStartSave()で決める(CreateCtrl()の時点ではまだ
+// 選局が済んでおらず、MMT/TLVを受信中かどうかを判定できないため)。
 struct UnifiedInstance {
     bool useMMTS = false;
     bool mmtsStarted = false;
     DWORD mmtsSessionId = 0;
     std::wstring mmtsSavePath;
+    // StartSave()で選んだモジュール。以降のStop/Statusは必ずこれを使う
+    // (sessionIdはモジュールごとに独立した番号空間なので、呼ぶたびに
+    //  モジュールを探し直すと別モジュールの無関係なセッションを操作しうる)。
+    DanttoMmtsApi mmtsApi;
+    HMODULE mmtsApiModuleRef = NULL;
     std::shared_ptr<CWriteMain> originalInst;
     std::mutex stateMutex;
 };
@@ -135,6 +192,39 @@ bool IsActiveMmtsPath(const std::wstring& path)
         }
     }
     return false;
+}
+
+// 走っているMMTS保存セッションがあれば止める
+// (sessionIdはモジュールごとに独立なので必ずStartSave()で選んだモジュールへ返す)
+void StopMmtsSession(const std::shared_ptr<UnifiedInstance>& inst)
+{
+    bool shouldStop = false;
+    {
+        std::lock_guard<std::mutex> stateLock(inst->stateMutex);
+        shouldStop = inst->mmtsStarted;
+        inst->mmtsStarted = false;
+    }
+    if (shouldStop && inst->mmtsApi.stop != nullptr) {
+        inst->mmtsApi.stop(inst->mmtsSessionId);
+    }
+}
+
+// StartSave()で取ったモジュール参照を返す
+void ReleaseMmtsProvider(const std::shared_ptr<UnifiedInstance>& inst)
+{
+    StopMmtsSession(inst);
+
+    HMODULE ref = NULL;
+    {
+        std::lock_guard<std::mutex> stateLock(inst->stateMutex);
+        ref = inst->mmtsApiModuleRef;
+        inst->mmtsApiModuleRef = NULL;
+        inst->mmtsApi = DanttoMmtsApi();
+        inst->useMMTS = false;
+    }
+    if (ref != NULL) {
+        FreeLibrary(ref);
+    }
 }
 
 DWORD AllocateInstanceId()
@@ -184,14 +274,15 @@ extern "C" __declspec(dllexport) void WINAPI Setting(
     HWND parentWnd
 )
 {
-    DanttoMmtsApi api = FindDanttoMmtsApi();
-
-    if (api.module != NULL) {
-        MessageBoxW(parentWnd, 
-            L"dantto4kと連携して、TS書き込みを無効化し、直接.mmtsを保存します。\n設定項目はありません。", 
-            PLUGIN_NAME, 
+    if (EnumMmtsProviders().empty() == false) {
+        // MMTS保存に対応したBonDriverが同一プロセスにいる。ただしMMTS保存になるのは
+        // 実際にMMT/TLVを受信中の録画だけで、通常のTSチャンネルは以下の設定に従って
+        // .tsとして保存されるため、設定画面はそのまま開く。
+        MessageBoxW(parentWnd,
+            L"MMT/TLV(4K/8K)を受信中の録画は、TS書き込みを行わず直接.mmtsを保存します。\n"
+            L"それ以外のチャンネルは以下の設定に従って通常の.tsとして保存します。",
+            PLUGIN_NAME,
             MB_OK | MB_ICONINFORMATION);
-        return;
     }
 
 #ifdef _WIN32
@@ -222,6 +313,53 @@ extern "C" __declspec(dllexport) void WINAPI Setting(
 #endif
 }
 
+// TSフォールバック用のEDCB標準Write PlugIn相当のインスタンスを用意する。
+// MMTS保存になる録画では使わないので(USE_ONSERVICEでは下位プラグインDLLの
+// ロードまで行うため)、StartSave()でTS保存に決まってから生成する。
+bool EnsureOriginalInstance(const std::shared_ptr<UnifiedInstance>& inst)
+{
+    if (inst->originalInst) {
+        return true;
+    }
+
+    // original CreateCtrl logic compiled statically
+#ifdef USE_ONSERVICE
+    fs_path pluginPath;
+    fs_path iniPath = GetModuleIniPath(g_instance);
+    wstring pluginName = GetPrivateProfileToString(L"SET", L"WritePlugin", L"", iniPath.c_str());
+    if( pluginName.empty() == false && pluginName[0] != L';' ){
+        pluginPath = GetModulePath(g_instance);
+        pluginPath.replace_filename(pluginName);
+    }
+#else
+    fs_path iniPath = GetModuleIniPath(g_instance);
+    DWORD buffSize = GetPrivateProfileInt(L"SET", L"Size", 770048, iniPath.c_str());
+    DWORD teeSize = 0;
+    DWORD teeDelay = 0;
+    wstring teeCmd = GetPrivateProfileToString(L"SET", L"TeeCmd", L"", iniPath.c_str());
+    if( teeCmd.empty() == false ){
+        teeSize = GetPrivateProfileInt(L"SET", L"TeeSize", 770048, iniPath.c_str());
+        teeDelay = GetPrivateProfileInt(L"SET", L"TeeDelay", 0, iniPath.c_str());
+    }
+#endif
+
+    try {
+        inst->originalInst = std::make_shared<CWriteMain>();
+#ifdef USE_ONSERVICE
+        if( pluginPath.empty() == false ){
+            inst->originalInst->InitializeDownstreamPlugin(pluginPath.native());
+        }
+#else
+        inst->originalInst->SetBufferSize(buffSize);
+        inst->originalInst->SetTeeCommand(teeCmd.c_str(), teeSize, teeDelay);
+#endif
+    } catch (std::bad_alloc&) {
+        inst->originalInst.reset();
+        return false;
+    }
+    return true;
+}
+
 extern "C" __declspec(dllexport) BOOL WINAPI CreateCtrl(
     DWORD* id
 )
@@ -229,57 +367,16 @@ extern "C" __declspec(dllexport) BOOL WINAPI CreateCtrl(
     if (id == NULL) {
         return FALSE;
     }
-    
+
     std::lock_guard<std::mutex> lock(g_mutex);
     std::shared_ptr<UnifiedInstance> inst = std::make_shared<UnifiedInstance>();
     if (!inst) {
         return FALSE;
     }
 
-    DanttoMmtsApi api = FindDanttoMmtsApi();
-
-    if (api.module != NULL) {
-        // Modified dantto4k is loaded! Use MMTS recording mode
-        inst->useMMTS = true;
-    } else {
-        // dantto4k is NOT loaded or unmodified. Fallback to statically compiled TS plugin!
-        inst->useMMTS = false;
-        
-        // original CreateCtrl logic compiled statically
-#ifdef USE_ONSERVICE
-        fs_path pluginPath;
-        fs_path iniPath = GetModuleIniPath(g_instance);
-        wstring pluginName = GetPrivateProfileToString(L"SET", L"WritePlugin", L"", iniPath.c_str());
-        if( pluginName.empty() == false && pluginName[0] != L';' ){
-            pluginPath = GetModulePath(g_instance);
-            pluginPath.replace_filename(pluginName);
-        }
-#else
-        fs_path iniPath = GetModuleIniPath(g_instance);
-        DWORD buffSize = GetPrivateProfileInt(L"SET", L"Size", 770048, iniPath.c_str());
-        DWORD teeSize = 0;
-        DWORD teeDelay = 0;
-        wstring teeCmd = GetPrivateProfileToString(L"SET", L"TeeCmd", L"", iniPath.c_str());
-        if( teeCmd.empty() == false ){
-            teeSize = GetPrivateProfileInt(L"SET", L"TeeSize", 770048, iniPath.c_str());
-            teeDelay = GetPrivateProfileInt(L"SET", L"TeeDelay", 0, iniPath.c_str());
-        }
-#endif
-
-        try {
-            inst->originalInst = std::make_shared<CWriteMain>();
-#ifdef USE_ONSERVICE
-            if( pluginPath.empty() == false ){
-                inst->originalInst->InitializeDownstreamPlugin(pluginPath.native());
-            }
-#else
-            inst->originalInst->SetBufferSize(buffSize);
-            inst->originalInst->SetTeeCommand(teeCmd.c_str(), teeSize, teeDelay);
-#endif
-        } catch (std::bad_alloc&) {
-            return FALSE;
-        }
-    }
+    // MMTS保存かTS保存かはStartSave()まで決められない
+    // (EDCBはCreateCtrl()の後にStartSave()を呼ぶが、MMT/TLVを受信中かどうかは
+    //  選局後でないと分からず、CreateCtrl()の時点では判定できないため)
 
     DWORD newId = AllocateInstanceId();
     if (newId == 0) {
@@ -305,20 +402,7 @@ extern "C" __declspec(dllexport) BOOL WINAPI DeleteCtrl(
         g_instances.erase(it);
     }
 
-    if (inst->useMMTS) {
-        bool shouldStop = false;
-        {
-            std::lock_guard<std::mutex> stateLock(inst->stateMutex);
-            shouldStop = inst->mmtsStarted;
-            inst->mmtsStarted = false;
-        }
-        if (shouldStop) {
-            DanttoMmtsApi api = FindDanttoMmtsApi();
-            if (api.stop != nullptr) {
-                api.stop(inst->mmtsSessionId);
-            }
-        }
-    }
+    ReleaseMmtsProvider(inst);
     return TRUE;
 }
 
@@ -340,16 +424,32 @@ extern "C" __declspec(dllexport) BOOL WINAPI StartSave(
         inst = it->second;
     }
 
+    // 今どちらで保存するかをここで決める。MMT/TLVを出力しているモジュールが
+    // 1つに確定したときだけMMTS保存を行い、それ以外(通常のTSチャンネル受信中など)は
+    // 従来のTS保存にフォールバックする。
+    // 前回のStartSave()で取ったモジュール参照はここで返す
+    // (EDCBは空き容量が尽きたときなどに同じctrlへStartSave()を再度呼ぶ)。
+    ReleaseMmtsProvider(inst);
+
+    DanttoMmtsApi selectedApi;
+    if (SelectMmtsProvider(&selectedApi)) {
+        HMODULE moduleRef = AcquireProviderModule(selectedApi);
+        if (moduleRef != NULL) {
+            std::lock_guard<std::mutex> stateLock(inst->stateMutex);
+            inst->mmtsApi = selectedApi;
+            inst->mmtsApiModuleRef = moduleRef;
+            inst->useMMTS = true;
+        }
+    }
+
     if (inst->useMMTS) {
         if (fileName == NULL) {
+            ReleaseMmtsProvider(inst);
             return FALSE;
         }
 
         std::wstring path = MakeMmtsPath(fileName);
-        DanttoMmtsApi api = FindDanttoMmtsApi();
-        if (api.start == nullptr || api.stop == nullptr) {
-            return FALSE;
-        }
+        const DanttoMmtsApi& api = inst->mmtsApi;
 
         DWORD sessionId = 0;
         BOOL started = FALSE;
@@ -398,14 +498,18 @@ extern "C" __declspec(dllexport) BOOL WINAPI StartSave(
             break;
         }
         if (!started) {
+            // MMT/TLVは受信できているのに保存を開始できなかった(書き込み先の
+            // エラー等)。ここでTS保存へ逃がすとMPEG2-TSに変換済みの映像だけが
+            // 残ってしまうので、EDCBには失敗として返す。
+            ReleaseMmtsProvider(inst);
             return FALSE;
         }
         return TRUE;
     } else {
-        if (inst->originalInst) {
-            return inst->originalInst->Start(fileName, overWriteFlag, createSize);
+        if (EnsureOriginalInstance(inst) == false) {
+            return FALSE;
         }
-        return FALSE;
+        return inst->originalInst->Start(fileName, overWriteFlag, createSize);
     }
 }
 
@@ -431,11 +535,12 @@ extern "C" __declspec(dllexport) BOOL WINAPI StopSave(
             inst->mmtsStarted = false;
         }
         if (shouldStop) {
-            DanttoMmtsApi api = FindDanttoMmtsApi();
-            if (api.stop == nullptr) {
+            if (inst->mmtsApi.stop == nullptr) {
                 return FALSE;
             }
-            api.stop(inst->mmtsSessionId);
+            // モジュール参照はDeleteCtrl()か次のStartSave()まで持ったままにする
+            // (停止後にGetSaveFilePath()を呼ばれても保存先を返せるようにするため)
+            inst->mmtsApi.stop(inst->mmtsSessionId);
         }
         return TRUE;
     } else {
@@ -535,15 +640,14 @@ extern "C" __declspec(dllexport) BOOL WINAPI AddTSBuff(
             }
             return FALSE;
         }
-        DanttoMmtsApi api = FindDanttoMmtsApi();
-        if (api.status == nullptr) {
+        if (inst->mmtsApi.status == nullptr) {
             if (writeSize != NULL) {
                 *writeSize = 0;
             }
             return FALSE;
         }
         BOOL failed = FALSE;
-        if (api.status(sessionId, nullptr, &failed, nullptr) == FALSE || failed) {
+        if (inst->mmtsApi.status(sessionId, nullptr, &failed, nullptr) == FALSE || failed) {
             if (writeSize != NULL) {
                 *writeSize = 0;
             }

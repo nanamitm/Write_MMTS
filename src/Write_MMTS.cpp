@@ -5,6 +5,7 @@
 #include <set>
 #include <mutex>
 #include <vector>
+#include <atomic>
 #include <tlhelp32.h>
 
 #ifndef PLUGIN_NAME
@@ -158,9 +159,25 @@ struct UnifiedInstance {
     //  モジュールを探し直すと別モジュールの無関係なセッションを操作しうる)。
     DanttoMmtsApi mmtsApi;
     HMODULE mmtsApiModuleRef = NULL;
+    // MMTS保存中の可用性再確認用。AddTSBuff()から間引いて問い合わせるための
+    // 前回確認時刻と、可用でなくなった時刻。
+    // (EDCBのWrite PlugInは_WIN32_WINNT_WS03向けにビルドするためGetTickCount64()を
+    //  使えない。GetTickCount()は約49日で一周するが、扱うのは差分だけなので
+    //  DWORDの符号なし演算でそのまま正しく求まる)
+    std::atomic<DWORD> availCheckTick{ 0 };
+    std::atomic<bool> unavailable{ false };
+    std::atomic<DWORD> unavailableSinceTick{ 0 };
     std::shared_ptr<CWriteMain> originalInst;
     std::mutex stateMutex;
 };
+
+// MMTS保存中の可用性を確認する間隔と、可用でない状態が続いたときに
+// 書き込みを失敗扱いにするまでの猶予。
+// 猶予はMMT/TLVチャンネル間で選局し直したときに誤検出しないためのもので、
+// その間に可用でなくなるのはCloseTuner()の実行中(スレッド終了待ちで最大数秒)
+// に限られるため、それより十分長く取る。
+static const DWORD MMTS_AVAILABILITY_CHECK_INTERVAL_MS = 1000;
+static const DWORD MMTS_AVAILABILITY_GRACE_MS = 10000;
 
 static std::map<DWORD, std::shared_ptr<UnifiedInstance>> g_instances;
 static std::set<std::wstring> g_pendingMmtsPaths;
@@ -192,6 +209,32 @@ bool IsActiveMmtsPath(const std::wstring& path)
         }
     }
     return false;
+}
+
+// MMTS保存中のモジュールがMMT/TLVを出力しなくなっていないか確認する。
+// AddTSBuff()から呼ばれるので問い合わせは間引き、また再選局の一瞬で誤検出
+// しないよう、可用でない状態が猶予時間続いた場合にだけ失われたと判定する。
+// IsMmtsRecordingAvailable()を持たないモジュール(MMT/TLV専用のdantto4k)は
+// 入力が常にMMT/TLVなので確認しない。
+bool IsMmtsProviderLost(const std::shared_ptr<UnifiedInstance>& inst)
+{
+    if (inst->mmtsApi.available == nullptr) {
+        return false;
+    }
+
+    const DWORD now = GetTickCount();
+    if (now - inst->availCheckTick.load() >= MMTS_AVAILABILITY_CHECK_INTERVAL_MS) {
+        inst->availCheckTick.store(now);
+        if (inst->mmtsApi.available() != FALSE) {
+            inst->unavailable.store(false);
+        } else if (!inst->unavailable.load()) {
+            inst->unavailableSinceTick.store(now);
+            inst->unavailable.store(true);
+        }
+    }
+
+    return inst->unavailable.load() &&
+        now - inst->unavailableSinceTick.load() >= MMTS_AVAILABILITY_GRACE_MS;
 }
 
 // 走っているMMTS保存セッションがあれば止める
@@ -475,6 +518,8 @@ extern "C" __declspec(dllexport) BOOL WINAPI StartSave(
             started = api.start(candidate.c_str(), overWriteFlag, &sessionId);
             if (started) {
                 path = candidate;
+                inst->availCheckTick.store(GetTickCount());
+                inst->unavailable.store(false);
                 std::lock_guard<std::mutex> lock(g_mutex);
                 {
                     std::lock_guard<std::mutex> stateLock(inst->stateMutex);
@@ -648,6 +693,16 @@ extern "C" __declspec(dllexport) BOOL WINAPI AddTSBuff(
         }
         BOOL failed = FALSE;
         if (inst->mmtsApi.status(sessionId, nullptr, &failed, nullptr) == FALSE || failed) {
+            if (writeSize != NULL) {
+                *writeSize = 0;
+            }
+            return FALSE;
+        }
+        // 保存を開始した後でMMT/TLVでないチャンネルに変わっていないか確認する。
+        // EDCBは録画中に選局しないが、TVTest(LibISDBのEDCBPluginWriter経由)は
+        // 録画中でもチャンネルを変えられる。変わってもMMTS保存側は失敗を報告
+        // しないため、.mmtsが伸びないまま録画が続いてしまう。
+        if (IsMmtsProviderLost(inst)) {
             if (writeSize != NULL) {
                 *writeSize = 0;
             }

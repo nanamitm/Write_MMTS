@@ -30,7 +30,8 @@ struct DanttoMmtsApi {
     GetMmtsRecordingStatusFunc status = nullptr;
     // MMT/TLV以外のチャンネルも扱うモジュール(BonDriver_Mirakurun等)が
     // 「今MMT/TLVを出力しているか」を答えるためのオプションのexport。
-    // 持たないモジュール(dantto4k等のMMT/TLV専用BonDriver)ではnullptr。
+    // dantto4kも実装しており、パススルー時はFALSEを返す。
+    // このexportを持たない従来のMMT/TLV専用モジュールではnullptr。
     IsMmtsRecordingAvailableFunc available = nullptr;
 };
 
@@ -63,10 +64,10 @@ std::vector<DanttoMmtsApi> EnumMmtsProviders()
 }
 
 // 今まさにMMT/TLVを出力しているモジュールを1つに絞る。
-//  - IsMmtsRecordingAvailable()を持つモジュール(BonDriver_Mirakurun等、GR/BS/CSの
-//    TSチャンネルも同じDLLで扱うBonDriver)は、TRUEを返したときだけ候補にする。
-//  - 持たないモジュール(dantto4k等のMMT/TLV専用BonDriver)は入力が常にMMT/TLVなので
-//    常に候補にする(こちらは変更なしでそのまま使える)。
+//  - IsMmtsRecordingAvailable()を持つモジュール(dantto4k、BonDriver_Mirakurun等)は、
+//    TRUEを返したときだけ候補にする。dantto4kはパススルー時にFALSEを返す。
+//  - 持たない従来のMMT/TLV専用モジュールは、入力が常にMMT/TLVである前提で
+//    常に候補にする(互換性維持のため)。
 // 候補がちょうど1つのときだけMMTS保存を行う。候補が0個(=通常のTSチャンネルを受信中)
 // のときはもちろん、複数見つかった場合(dantto4kがMMT変換を有効にしたままの
 // BonDriver_Mirakurunをラップしている等、どのモジュールの出力がEDCBに届いているか
@@ -214,8 +215,8 @@ bool IsActiveMmtsPath(const std::wstring& path)
 // MMTS保存中のモジュールがMMT/TLVを出力しなくなっていないか確認する。
 // AddTSBuff()から呼ばれるので問い合わせは間引き、また再選局の一瞬で誤検出
 // しないよう、可用でない状態が猶予時間続いた場合にだけ失われたと判定する。
-// IsMmtsRecordingAvailable()を持たないモジュール(MMT/TLV専用のdantto4k)は
-// 入力が常にMMT/TLVなので確認しない。
+// IsMmtsRecordingAvailable()を持つdantto4k等は確認対象になる。
+// このexportを持たない従来のモジュールは、入力が常にMMT/TLVである前提で確認しない。
 bool IsMmtsProviderLost(const std::shared_ptr<UnifiedInstance>& inst)
 {
     if (inst->mmtsApi.available == nullptr) {

@@ -15,6 +15,7 @@
 CWriteMain::CWriteMain(void)
 {
 	this->writeBuffSize = 0;
+	this->writeFailed = false;
 }
 
 
@@ -96,6 +97,7 @@ BOOL CWriteMain::Start(
 		rewind(this->file.get());
 	}
 	this->wrotePos = 0;
+	this->writeFailed = false;
 
 	//コマンドに分岐出力
 	if( this->teeCmd.empty() == false ){
@@ -115,17 +117,22 @@ BOOL CWriteMain::Stop(
 	if( this->file ){
 		if( this->writeBuff.empty() == false ){
 			size_t n = fwrite(this->writeBuff.data(), 1, this->writeBuff.size(), this->file.get());
-			if( n == 0 ){
+			if( n != this->writeBuff.size() ){
 				AddDebugLogFormat(L"★WriteFile Err:errno=%d", errno);
-			}else{
-				this->writeBuff.erase(this->writeBuff.begin(), this->writeBuff.begin() + n);
-				lock_recursive_mutex lock(this->wroteLock);
-				this->wrotePos += n;
+				this->writeFailed = true;
 			}
+			this->writeBuff.erase(this->writeBuff.begin(), this->writeBuff.begin() + n);
+			lock_recursive_mutex lock(this->wroteLock);
+			this->wrotePos += n;
 			//未出力のバッファは再Start()に備えて繰り越す
 		}
-		TruncateFile(this->file.get());
-		this->file.reset();
+		if( TruncateFile(this->file.get()) == false ){
+			this->writeFailed = true;
+		}
+		if( fclose(this->file.release()) != 0 ){
+			AddDebugLogFormat(L"★CloseFile Err:errno=%d", errno);
+			this->writeFailed = true;
+		}
 	}
 	if( this->teeThread.joinable() ){
 		this->teeThreadStopEvent.Set();
@@ -133,7 +140,7 @@ BOOL CWriteMain::Stop(
 	}
 	this->teeFile.reset();
 
-	return TRUE;
+	return this->writeFailed ? FALSE : TRUE;
 }
 
 wstring CWriteMain::GetSavePath(
@@ -148,60 +155,74 @@ BOOL CWriteMain::Write(
 	DWORD* writeSize
 	)
 {
-	if( this->file && data != NULL && size > 0 ){
-		*writeSize = 0;
-		if( this->writeBuff.empty() == false ){
-			//できるだけバッファにコピー。コピー済みデータは呼び出し側にとっては「保存済み」となる
-			*writeSize = min(size, this->writeBuffSize - (DWORD)this->writeBuff.size());
-			this->writeBuff.insert(this->writeBuff.end(), data, data + *writeSize);
-			data += *writeSize;
-			size -= *writeSize;
-			if( this->writeBuff.size() >= this->writeBuffSize ){
-				//バッファが埋まったので出力
-				size_t n = fwrite(this->writeBuff.data(), 1, this->writeBuff.size(), this->file.get());
-				if( n == 0 ){
-					AddDebugLogFormat(L"★WriteFile Err:errno=%d", errno);
-					TruncateFile(this->file.get());
-					this->file.reset();
-					return FALSE;
-				}
-				this->writeBuff.erase(this->writeBuff.begin(), this->writeBuff.begin() + n);
-				lock_recursive_mutex lock(this->wroteLock);
-				this->wrotePos += n;
-			}
-			if( this->writeBuff.empty() == false || size == 0 ){
-				return TRUE;
-			}
-		}
-		if( size > this->writeBuffSize ){
-			//バッファサイズより大きいのでそのまま出力
-			size_t n = fwrite(data, 1, size, this->file.get());
-			if( n == 0 ){
-				AddDebugLogFormat(L"★WriteFile Err:errno=%d", errno);
-				TruncateFile(this->file.get());
-				this->file.reset();
-				return FALSE;
-			}
-			*writeSize += (DWORD)n;
-			lock_recursive_mutex lock(this->wroteLock);
-			this->wrotePos += n;
-		}else{
-			//バッファにコピー
-			*writeSize += size;
-			this->writeBuff.insert(this->writeBuff.end(), data, data + size);
-		}
-		return TRUE;
+	if( this->file == nullptr || data == nullptr || size == 0 ){
+		return FALSE;
 	}
-	return FALSE;
+	*writeSize = 0;
+	auto writeData = [this](const BYTE* buffer, size_t length) {
+		size_t n = fwrite(buffer, 1, length, this->file.get());
+		lock_recursive_mutex lock(this->wroteLock);
+		this->wrotePos += n;
+		return n;
+	};
+	auto failWrite = [this]() {
+		AddDebugLogFormat(L"★WriteFile Err:errno=%d", errno);
+		this->writeFailed = true;
+		TruncateFile(this->file.get());
+		this->file.reset();
+		return FALSE;
+	};
+
+	if( this->writeBuff.empty() == false ){
+		//バッファが受け取ったデータは、代替先への再Start()時も保持する。
+		*writeSize = min(size, this->writeBuffSize - (DWORD)this->writeBuff.size());
+		this->writeBuff.insert(this->writeBuff.end(), data, data + *writeSize);
+		data += *writeSize;
+		size -= *writeSize;
+		if( this->writeBuff.size() >= this->writeBuffSize ){
+			size_t n = writeData(this->writeBuff.data(), this->writeBuff.size());
+			this->writeBuff.erase(this->writeBuff.begin(), this->writeBuff.begin() + n);
+			if( this->writeBuff.empty() == false ){
+				return failWrite();
+			}
+		}
+		if( size == 0 ){
+			return TRUE;
+		}
+	}
+	if( size > this->writeBuffSize ){
+		size_t n = writeData(data, size);
+		*writeSize += (DWORD)n;
+		if( n != size ){
+			return failWrite();
+		}
+	}else{
+		*writeSize += size;
+		this->writeBuff.insert(this->writeBuff.end(), data, data + size);
+	}
+	return TRUE;
 }
 
-void CWriteMain::TruncateFile(FILE* fp)
+bool CWriteMain::TruncateFile(FILE* fp)
 {
 #ifdef _WIN32
-	SetEndOfFile((HANDLE)_get_osfhandle(_fileno(fp)));
+	if( SetEndOfFile((HANDLE)_get_osfhandle(_fileno(fp))) == FALSE ){
+		AddDebugLogFormat(L"★CWriteMain::TruncateFile Err:winerr=%d", GetLastError());
+		return false;
+	}
 #else
-	ftruncate(fileno(fp), ftello(fp));
+	auto end = ftello(fp);
+	if( end < 0 ){
+		return false;
+	}
+	while( ftruncate(fileno(fp), end) < 0 ){
+		if( errno != EINTR ){
+			AddDebugLogFormat(L"★CWriteMain::TruncateFile Err:errno=%d", errno);
+			return false;
+		}
+	}
 #endif
+	return true;
 }
 
 void CWriteMain::TeeThread(CWriteMain* sys)

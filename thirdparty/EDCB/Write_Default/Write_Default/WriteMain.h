@@ -72,6 +72,7 @@ protected:
 
 	vector<BYTE> writeBuff;
 	DWORD writeBuffSize;
+	bool writeFailed;
 	LONGLONG wrotePos;
 	recursive_mutex_ wroteLock;
 
@@ -82,7 +83,7 @@ protected:
 	vector<BYTE> teeBuff;
 	DWORD teeDelay;
 
-	static void TruncateFile(FILE* fp);
+	static bool TruncateFile(FILE* fp);
 	static void TeeThread(CWriteMain* sys);
 };
 

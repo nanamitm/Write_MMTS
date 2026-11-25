@@ -68,5 +68,10 @@ private:
 	CPacketInit packetInit;
 	CServiceFilter serviceFilter;
 	vector<BYTE> outBuff;
+	//書き出しに失敗した(Stop()で報告する)
+	bool writeFailed = false;
+
+	//書き出しに失敗したことを記録する
+	BOOL FailWrite();
 };
 

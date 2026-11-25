@@ -357,6 +357,33 @@ extern "C" __declspec(dllexport) void WINAPI Setting(
 #endif
 }
 
+#ifdef USE_ONSERVICE
+static bool IsSamePluginFile(const fs_path& modulePath, const fs_path& pluginPath)
+{
+    if (UtilComparePath(modulePath.c_str(), pluginPath.c_str()) == 0) {
+        return true;
+    }
+
+    // 相対パスやハードリンクなど、別名で同じDLLを指定した場合も検出する。
+    const auto getFileInfo = [](const fs_path& path, BY_HANDLE_FILE_INFORMATION& info) {
+        HANDLE file = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+        const bool success = GetFileInformationByHandle(file, &info) != FALSE;
+        CloseHandle(file);
+        return success;
+    };
+    BY_HANDLE_FILE_INFORMATION moduleInfo;
+    BY_HANDLE_FILE_INFORMATION pluginInfo;
+    return getFileInfo(modulePath, moduleInfo) && getFileInfo(pluginPath, pluginInfo) &&
+           moduleInfo.dwVolumeSerialNumber == pluginInfo.dwVolumeSerialNumber &&
+           moduleInfo.nFileIndexHigh == pluginInfo.nFileIndexHigh &&
+           moduleInfo.nFileIndexLow == pluginInfo.nFileIndexLow;
+}
+#endif
+
 // TSフォールバック用のEDCB標準Write PlugIn相当のインスタンスを用意する。
 // MMTS保存になる録画では使わないので(USE_ONSERVICEでは下位プラグインDLLの
 // ロードまで行うため)、StartSave()でTS保存に決まってから生成する。
@@ -372,8 +399,13 @@ bool EnsureOriginalInstance(const std::shared_ptr<UnifiedInstance>& inst)
     fs_path iniPath = GetModuleIniPath(g_instance);
     wstring pluginName = GetPrivateProfileToString(L"SET", L"WritePlugin", L"", iniPath.c_str());
     if( pluginName.empty() == false && pluginName[0] != L';' ){
-        pluginPath = GetModulePath(g_instance);
+        const fs_path modulePath = GetModulePath(g_instance);
+        pluginPath = modulePath;
         pluginPath.replace_filename(pluginName);
+        if (IsSamePluginFile(modulePath, pluginPath)) {
+            AddDebugLog(L"Write_MMTS: ignoring a WritePlugin setting that points to this DLL");
+            pluginPath.clear();
+        }
     }
 #else
     fs_path iniPath = GetModuleIniPath(g_instance);

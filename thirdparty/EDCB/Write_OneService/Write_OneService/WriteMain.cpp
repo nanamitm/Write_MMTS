@@ -92,6 +92,7 @@ BOOL CWriteMain::Start(
 		}
 	}
 
+	this->writeFailed = false;
 	this->lastTSID = 0;
 	this->packetInit.ClearBuff();
 	this->serviceFilter.SetServiceID(this->targetSID == 0, vector<WORD>(1, this->targetSID));
@@ -102,11 +103,25 @@ BOOL CWriteMain::Start(
 BOOL CWriteMain::Stop(
 	)
 {
-	this->file.reset();
-	if( this->writePlugin ){
-		this->writePlugin->Stop();
+	//書き出しや終了処理の失敗は録画の失敗として報告する
+	BOOL ret = this->writeFailed ? FALSE : TRUE;
+	if( this->file && fclose(this->file.release()) != 0 ){
+		AddDebugLog(L"★CWriteMain::Stop CloseFile Err");
+		ret = FALSE;
 	}
-	return TRUE;
+	if( this->writePlugin && this->writePlugin->Stop() == FALSE ){
+		ret = FALSE;
+	}
+	this->writeFailed = false;
+	return ret;
+}
+
+BOOL CWriteMain::FailWrite()
+{
+	AddDebugLog(L"★CWriteMain::Write Err");
+	this->writeFailed = true;
+	this->file.reset();
+	return FALSE;
 }
 
 wstring CWriteMain::GetSavePath(
@@ -127,14 +142,14 @@ BOOL CWriteMain::Write(
 			//全サービスなので何も弄らない
 			if( this->writePlugin ){
 				if( this->writePlugin->Write(data, size, writeSize) == FALSE ){
+					this->writeFailed = true;
 					return FALSE;
 				}
 			}else{
+				//一部だけ書けた場合は書けた量を返し、残りは呼び出し側が再送する
 				*writeSize = (DWORD)fwrite(data, 1, size, this->file.get());
 				if( *writeSize == 0 ){
-					AddDebugLog(L"★CWriteMain::Write Err");
-					this->file.reset();
-					return FALSE;
+					return FailWrite();
 				}
 			}
 			return TRUE;
@@ -166,17 +181,21 @@ BOOL CWriteMain::Write(
 				*writeSize = size;
 				return TRUE;
 			}
-			DWORD write;
-			if( this->writePlugin ){
-				if( this->writePlugin->Write(&this->outBuff.front(), (DWORD)this->outBuff.size(), &write) == FALSE ){
-					return FALSE;
+			//抽出したデータは入力と対応しないので、すべて書き切れなければ失敗とする(黙って欠落させない)
+			for( size_t done = 0; done < this->outBuff.size(); ){
+				DWORD remaining = (DWORD)(this->outBuff.size() - done);
+				DWORD write = 0;
+				if( this->writePlugin ){
+					if( this->writePlugin->Write(&this->outBuff[done], remaining, &write) == FALSE || write == 0 || write > remaining ){
+						return FailWrite();
+					}
+				}else{
+					write = (DWORD)fwrite(&this->outBuff[done], 1, remaining, this->file.get());
+					if( write == 0 ){
+						return FailWrite();
+					}
 				}
-			}else{
-				if( fwrite(&this->outBuff.front(), 1, this->outBuff.size(), this->file.get()) == 0 ){
-					AddDebugLog(L"★CWriteMain::Write Err");
-					this->file.reset();
-					return FALSE;
-				}
+				done += write;
 			}
 			*writeSize = size;
 			return TRUE;
